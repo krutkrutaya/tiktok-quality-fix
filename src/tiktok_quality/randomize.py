@@ -24,8 +24,9 @@ from typing import List, Tuple
 class RandomOptions:
     enabled: bool = False
     seed: int | None = None
-    max_filler_payload: int = 48   # bytes of random payload per filler NAL
-    ts_jitter: int = 1             # max +/- ticks per stts entry
+    max_filler_payload: int = 128   # bytes of random payload per filler NAL (balanced)
+    min_filler_payload: int = 16    # minimum payload size for better variance
+    ts_jitter: int = 3              # max +/- ticks per stts entry (balanced)
     rng: random.Random = field(init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
@@ -49,7 +50,8 @@ def make_filler_pool(opts: RandomOptions, count: int) -> List[bytes]:
 
     pool: List[bytes] = []
     for _ in range(count):
-        payload_len = opts.rng.randint(0, opts.max_filler_payload)
+        # Use wider range for better variance (min_filler_payload to max_filler_payload)
+        payload_len = opts.rng.randint(opts.min_filler_payload, opts.max_filler_payload)
         nal_header = 0x00  # NAL type 0 = unspecified, ignored by decoders
         payload = bytes(opts.rng.randint(0, 0xFF) for _ in range(payload_len))
         nal = bytes([nal_header]) + payload
