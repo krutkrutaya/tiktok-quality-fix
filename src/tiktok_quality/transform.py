@@ -13,10 +13,10 @@ from .mp4.builder import (
     build_tkhd, build_hdlr, build_stts, build_stsc, build_stsz,
     build_stco, build_stsd_video, build_avcc, build_btrt, build_udta_comment,
 )
-
-# 8-byte filler NAL: length=4, type=0 (filler), empty payload
-PADDING_NAL = b'\x00\x00\x00\x04\x00\x00\x00\x00'
-PADDING_SIZE = 8
+from .randomize import (
+    RandomOptions, make_filler_pool, expand_stts, compress_stts,
+    jitter_durations, random_comment,
+)
 
 # NALU types to keep in first sample (strip SEI etc.)
 KEEP_NALU_TYPES = {1, 5}  # non-IDR slice, IDR slice
@@ -26,7 +26,8 @@ LANG_UND = 0x55c4
 
 
 def transform(input_path: str, output_path: str, multiplier: int = 10,
-              comment: str = 'TK8vY5VqBA6hUlo1yuGvNA', verbose: bool = True) -> dict:
+              comment: str | None = None, verbose: bool = True,
+              rand: RandomOptions | None = None) -> dict:
     """
     Apply the TikTok Enhancer transformation pipeline.
 
@@ -34,12 +35,19 @@ def transform(input_path: str, output_path: str, multiplier: int = 10,
         input_path: Path to source MP4 file (H.264/AVC).
         output_path: Path to write the manipulated MP4.
         multiplier: Frame count multiplier (default 10x).
-        comment: Metadata comment/signature string.
+        comment: Metadata comment/signature string. None -> random if
+                 rand.enabled, else empty (udta is skipped).
         verbose: Print progress messages.
+        rand: RandomOptions controlling filler pool / stts jitter / comment.
 
     Returns:
         Dict with stats about the transformation.
     """
+    if rand is None:
+        rand = RandomOptions(enabled=False)
+    if comment is None:
+        comment = random_comment() if rand.enabled else ''
+
     with open(input_path, 'rb') as f:
         data = f.read()
 
@@ -115,8 +123,9 @@ def transform(input_path: str, output_path: str, multiplier: int = 10,
 
     if has_audio:
         at_start, at_end = at_pos + 8, at_pos + at_size
-        a_stbl_pos, _ = find_box_path(data, ['mdia', 'minf', 'stbl'], at_start, at_end)
-        a_sb_start, a_sb_end = a_stbl_pos + 8, a_stbl_pos + _
+        a_stbl_pos, a_stbl_size = find_box_path(
+            data, ['mdia', 'minf', 'stbl'], at_start, at_end)
+        a_sb_start, a_sb_end = a_stbl_pos + 8, a_stbl_pos + a_stbl_size
 
         a_stco_pos, _ = find_box(data, 'stco', a_sb_start, a_sb_end)
         a_stsz_pos, a_stsz_size = find_box(data, 'stsz', a_sb_start, a_sb_end)
@@ -135,7 +144,7 @@ def transform(input_path: str, output_path: str, multiplier: int = 10,
 
         # Read audio ELST for timing alignment
         a_elst_pos, _ = find_box_path(data, ['edts', 'elst'], at_start, at_end)
-        a_elst_seg_dur = read_u32(data, a_elst_pos + 16)  # ms
+        a_elst_seg_dur = read_u32(data, a_elst_pos + 16)     # ms
         a_elst_media_time = read_u32(data, a_elst_pos + 20)  # ticks
 
         new_audio_dur_ms = a_elst_seg_dur
@@ -162,10 +171,13 @@ def transform(input_path: str, output_path: str, multiplier: int = 10,
         old_a_br = total_a_bytes * 8 * a_timescale // old_a_ticks
         new_a_br = total_a_bytes * 8 * a_timescale // new_a_ticks
 
-    # Build new mdat
+    # Build new mdat: same structure as before, but the single trailing
+    # filler NAL is replaced by a randomized pool of N filler NALs.
     mdat_before = data[mdat_data_start:first_off]
     mdat_after = data[first_off + first_size:mdat_pos + mdat_size]
-    new_mdat_content = mdat_before + new_first + mdat_after + PADDING_NAL
+
+    filler_pool = make_filler_pool(rand, pad_count)
+    new_mdat_content = mdat_before + new_first + mdat_after + b''.join(filler_pool)
     new_mdat = struct.pack('>I', 8 + len(new_mdat_content)) + b'mdat' + new_mdat_content
 
     # Build new moov
@@ -221,15 +233,20 @@ def transform(input_path: str, output_path: str, multiplier: int = 10,
 
     video_stsd_new = build_stsd_video(avc1_fixed, avcc_new, colr_box, pasp_box, btrt_new)
 
-    # Video tables
-    video_stts_new = build_stts([(orig_frames, time_delta), (pad_count, time_delta)])
+    # Video tables -- stts is now jittered, stsz uses per-filler sizes.
+    video_deltas = expand_stts(video_stts) + [time_delta] * pad_count
+    video_deltas = jitter_durations(video_deltas, rand)
+    video_stts_new = build_stts(compress_stts(video_deltas))
+
     video_stss = data[stss_pos:stss_pos + stss_size] if stss_pos else b''
     video_sdtp = data[sdtp_pos:sdtp_pos + sdtp_size] if sdtp_pos else b''
     video_ctts = data[ctts_pos:ctts_pos + ctts_size] if ctts_pos else b''
     video_stsc_new = build_stsc(list(video_stsc) + [(len(video_chunks) + 1, 1, 1)])
-    video_stsz_new = build_stsz([new_first_size] + video_sizes[1:] + [PADDING_SIZE] * pad_count)
 
-    # STCO placeholder
+    filler_sizes = [len(f) for f in filler_pool]
+    video_stsz_new = build_stsz([new_first_size] + video_sizes[1:] + filler_sizes)
+
+    # STCO placeholder (filled in after we know mdat_start)
     total_v_chunks = len(video_chunks) + pad_count
     stco_ph_size = 16 + total_v_chunks * 4
     v_stco_ph = struct.pack('>I', stco_ph_size) + b'stco' + b'\x00' * (stco_ph_size - 8)
@@ -290,21 +307,26 @@ def transform(input_path: str, output_path: str, multiplier: int = 10,
     else:
         audio_trak = b''
 
-    udta = build_udta_comment(comment)
+    udta = build_udta_comment(comment) if comment else b''
     moov = build_box('moov', mvhd + video_trak + audio_trak + udta)
     moov_size_final = len(moov)
 
     # Fill STCO offsets
     new_mdat_start = 32 + 8 + moov_size_final + 8
     first_video_rel = first_off - mdat_data_start
-    pad_abs = new_mdat_start + len(new_mdat_content) - PADDING_SIZE
 
     new_v_offsets = []
     for off in video_chunks:
         rel = off - mdat_data_start
         new_v_offsets.append(new_mdat_start + rel if rel <= first_video_rel
                             else new_mdat_start + rel - sei_removed)
-    new_v_offsets.extend([pad_abs] * pad_count)
+
+    # Ghost frames: each one now points at its own filler NAL block.
+    filler_base_in_mdat = len(mdat_before) + len(new_first) + len(mdat_after)
+    cur = new_mdat_start + filler_base_in_mdat
+    for f in filler_pool:
+        new_v_offsets.append(cur)
+        cur += len(f)
 
     new_a_offsets = []
     if has_audio:
@@ -343,11 +365,15 @@ def transform(input_path: str, output_path: str, multiplier: int = 10,
         'declared_frames': total_frames,
         'ghost_frames': pad_count,
         'multiplier': multiplier,
+        'randomized': rand.enabled,
+        'filler_pool_unique': len({bytes(b) for b in filler_pool}),
     }
 
     if verbose:
         print(f"[+] Output: {output_path} ({len(output):,} bytes)")
         print(f"[+] Delta: {stats['size_delta']:+,} bytes")
         print(f"[+] Frames: {orig_frames} -> {total_frames} (x{multiplier})")
+        if rand.enabled:
+            print(f"[+] Randomized: {stats['filler_pool_unique']} unique filler blocks")
 
     return stats
