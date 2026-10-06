@@ -1,0 +1,22 @@
+{
+  "_comment": "Reference spec for CompressBase output validation for TikTok.",
+  "format": {
+    "major_brand": "isom",
+    "compatible_brands": "isomiso2avc1mp41",
+    "require_no_creation_time": true
+  },
+  "streams": {
+    "video": {
+      "codec_name": "h264",
+      "profile": "Constrained Baseline",
+      "level": "4.2",
+      "pix_fmt": "yuv420p",
+      "bitrate_range_kbps": [500, 60000]
+    },
+    "audio": {
+      "count": 2,
+      "codec_name": "aac",
+      "sample_rate": 48000
+    }
+  }
+}
