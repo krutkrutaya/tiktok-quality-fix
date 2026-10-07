@@ -193,4 +193,4 @@ python -m unittest discover tests
 
 ## 📜 License
 
-MIT License. Created by [krutkrutaya](https://github.com/krutkrutaya).
+MIT License.
