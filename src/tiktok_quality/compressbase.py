@@ -3,12 +3,15 @@ compressbase.py
 ---------------
 Core CompressBase pipeline orchestrator:
 Executes FFmpeg re-encoding, binary ISOBMFF patching, and output validation.
+Provides timing metrics, progress tracking, and graceful task cancellation.
 """
 
 from __future__ import annotations
 
 import os
 import tempfile
+import threading
+import time
 from typing import Dict, Any, Optional, Callable
 
 from . import encoder as fw
@@ -26,7 +29,9 @@ def process_video(
     level: str = "4.2",
     comment: str = "Patched by CompressBase",
     audio_multiplier: int = 10,
+    video_encoder: str = "libx264",
     progress_callback: Optional[Callable[[float, str], None]] = None,
+    cancel_event: Optional[threading.Event] = None,
 ) -> Dict[str, Any]:
     """
     Run the CompressBase optimization pipeline on an input video:
@@ -42,14 +47,19 @@ def process_video(
       4. Validate output file against target_spec.json.
 
     Returns:
-      Dictionary with source and output stream summaries, duration, file sizes, and validation issues.
+      Dictionary with source and output stream summaries, duration, file sizes, timing, and validation issues.
     """
     if not os.path.isfile(input_path):
         raise FileNotFoundError(f"Input file not found: {input_path}")
 
+    start_time = time.perf_counter()
+
     source_probe = fw.probe(input_path)
     if not fw.get_audio_streams(source_probe):
         raise RuntimeError("Input file must contain at least one audio track.")
+
+    if cancel_event and cancel_event.is_set():
+        raise RuntimeError("Processing cancelled by user before encoding.")
 
     tmp_fd, tmp_path = tempfile.mkstemp(suffix=".mp4", prefix="cb_temp_")
     os.close(tmp_fd)
@@ -65,8 +75,13 @@ def process_video(
             preset=preset,
             level=level,
             comment=comment,
+            video_encoder=video_encoder,
             progress_callback=progress_callback,
+            cancel_event=cancel_event,
         )
+
+        if cancel_event and cancel_event.is_set():
+            raise RuntimeError("Processing cancelled by user after encoding.")
 
         # Step 2: Binary ISOBMFF patches
         iso.apply_isobmff_patches(
@@ -90,6 +105,10 @@ def process_video(
     output_probe = fw.probe(output_path)
     issues = val.validate_output(output_probe)
 
+    elapsed_time = time.perf_counter() - start_time
+    src_size = os.path.getsize(input_path)
+    dst_size = os.path.getsize(output_path)
+
     return {
         "source": val.stream_summary(source_probe),
         "output": val.stream_summary(output_probe),
@@ -98,5 +117,8 @@ def process_video(
             "issues": issues,
         },
         "durationSeconds": round(fw.get_duration_seconds(output_probe), 3),
-        "sizeBytes": os.path.getsize(output_path),
+        "sizeBytes": dst_size,
+        "sourceSizeBytes": src_size,
+        "elapsedSeconds": round(elapsed_time, 2),
+        "compressionRatio": round((dst_size / src_size * 100) if src_size > 0 else 100, 1),
     }

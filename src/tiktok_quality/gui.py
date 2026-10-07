@@ -1,33 +1,79 @@
 """
 gui.py
 ------
-Tkinter GUI for TikTok Quality Fix (CompressBase Method).
-Provides batch conversion, customizable encoding parameters, real-time progress bars,
-color-coded execution log, and target specification validation.
+Modern GUI for TikTok Quality Fix (CompressBase Method) using CustomTkinter.
+Provides batch video queuing, hardware acceleration selection, preset management,
+dual progress bars, real-time logging, and output validation.
+Includes graceful fallback to ttk if CustomTkinter is unavailable.
 """
 
 from __future__ import annotations
 
 import os
 import queue
+import subprocess
+import sys
 import tempfile
 import threading
-import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
 from typing import Dict, Any, List, Optional
 
+from . import __version__
 from . import encoder as fw
 from . import patcher as iso
 from . import validator as val
+from .compressbase import process_video
+
+# Attempt to import CustomTkinter, with fallback to standard tkinter
+try:
+    import customtkinter as ctk
+    _USE_CTK = True
+except ImportError:
+    import tkinter as tk
+    from tkinter import ttk, messagebox, filedialog
+    ctk = None  # type: ignore
+    _USE_CTK = False
+
+if _USE_CTK:
+    import tkinter as tk
+    from tkinter import filedialog, messagebox
 
 
 class Msg:
     LOG = "log"
-    PROGRESS_FILE = "progress_file"     # (index, percent)
+    PROGRESS_FILE = "progress_file"     # (index, percent, status_line)
     PROGRESS_TOTAL = "progress_total"   # (done, total)
     FILE_DONE = "file_done"             # (index, success, summary)
     ALL_DONE = "all_done"
     ERROR = "error"                     # (index, message)
+
+
+PRESETS = {
+    "⚡ TikTok 1080p60 (Рекомендуемый)": {
+        "bitrate_multiplier": 1.0,
+        "preset": "fast",
+        "level": "4.2",
+        "audio_bitrate1": 190,
+        "audio_bitrate2": 215,
+        "encoder": "auto",
+    },
+    "💎 Максимальное качество (HQ)": {
+        "bitrate_multiplier": 1.25,
+        "preset": "slow",
+        "level": "4.2",
+        "audio_bitrate1": 192,
+        "audio_bitrate2": 256,
+        "encoder": "auto",
+    },
+    "🚀 Ультра-быстрый (Fast)": {
+        "bitrate_multiplier": 1.0,
+        "preset": "ultrafast",
+        "level": "4.2",
+        "audio_bitrate1": 190,
+        "audio_bitrate2": 215,
+        "encoder": "auto",
+    },
+    "⚙️ Пользовательский (Custom)": None,
+}
 
 
 def process_single_file(
@@ -36,6 +82,7 @@ def process_single_file(
     output_dir: str,
     params: Dict[str, Any],
     msg_queue: queue.Queue,
+    cancel_event: threading.Event,
 ):
     """Process a single video through the CompressBase pipeline in a worker thread."""
 
@@ -43,383 +90,516 @@ def process_single_file(
         msg_queue.put((Msg.LOG, text))
 
     def prog(pct: float, line: str = ""):
-        msg_queue.put((Msg.PROGRESS_FILE, (index, pct)))
-        if line:
-            log(f"  ffmpeg: {line}")
+        msg_queue.put((Msg.PROGRESS_FILE, (index, pct, line)))
 
     basename = os.path.basename(input_path)
     stem, _ = os.path.splitext(basename)
     output_path = os.path.join(output_dir, f"{stem}_compressbase.mp4")
 
     log(f"\n{'='*60}")
-    log(f"[{index + 1}] Processing: {basename}")
-    log(f"    Output : {output_path}")
+    log(f"[{index + 1}] Обработка файла: {basename}")
+    log(f"    Куда: {output_path}")
 
-    tmp_path: Optional[str] = None
     try:
-        # 1. Probe input
-        log("  Probing source video…")
-        src_probe = fw.probe(input_path)
-        log(fw.format_probe_summary(src_probe, "SOURCE"))
+        if cancel_event.is_set():
+            log("  [!] Отменено пользователем.")
+            msg_queue.put((Msg.FILE_DONE, (index, False, "Отменено")))
+            return
 
-        # 2. Encode to temp file
-        tmp_fd, tmp_path = tempfile.mkstemp(suffix=".mp4", prefix="cb_tmp_")
-        os.close(tmp_fd)
-
-        log("  Encoding via FFmpeg (H.264 CBL + Dual AAC)…")
-        fw.encode(
+        result = process_video(
             input_path=input_path,
-            output_path=tmp_path,
+            output_path=output_path,
             bitrate_multiplier=params["bitrate_multiplier"],
-            audio_bitrate1_kbps=params["audio_bitrate1"],
-            audio_bitrate2_kbps=params["audio_bitrate2"],
+            audio_bitrate1=params["audio_bitrate1"],
+            audio_bitrate2=params["audio_bitrate2"],
             preset=params["preset"],
             level=params["level"],
             comment=params["comment"],
-            progress_callback=prog,
-        )
-
-        # 3. Binary ISOBMFF patches
-        log("  Applying ISOBMFF binary patches (ftyp, timestamps, hdlr, audio2)…")
-        iso.apply_isobmff_patches(
-            input_path=tmp_path,
-            output_path=output_path,
-            major_brand="isom",
-            minor_version=512,
-            compatible_brands=["isom", "iso2", "avc1", "mp41"],
-            remove_creation_time=True,
-            encoder="Lavf59.27.100",
             audio_multiplier=params.get("audio_multiplier", 10),
+            video_encoder=params.get("video_encoder", "libx264"),
+            progress_callback=prog,
+            cancel_event=cancel_event,
         )
 
-        # 4. Probe output & validate
-        log("  Probing output and validating…")
-        final_probe = fw.probe(output_path)
-        log(fw.format_probe_summary(final_probe, "OUTPUT"))
-
-        issues = val.validate_output(final_probe)
+        val_info = result.get("validation", {})
+        issues = val_info.get("issues", [])
         if issues:
-            log("  [!] Validation issues:")
+            log("  [!] Замечания валидации:")
             for iss in issues:
                 log(f"    - {iss}")
         else:
-            log("  [+] Validation passed: 100% compliant with TikTok / CompressBase spec.")
+            log("  [+] Валидация успешна: 100% совместимо с TikTok CompressBase!")
 
-        src_size = os.path.getsize(input_path)
-        dst_size = os.path.getsize(output_path)
-        ratio = (dst_size / src_size * 100) if src_size > 0 else 0
-        log(f"  Size: {src_size / 1024 / 1024:.2f} MB -> {dst_size / 1024 / 1024:.2f} MB ({ratio:.0f}%)")
+        src_mb = result["sourceSizeBytes"] / 1024 / 1024
+        out_mb = result["sizeBytes"] / 1024 / 1024
+        ratio = result["compressionRatio"]
+        elapsed = result["elapsedSeconds"]
+        log(f"  Размер: {src_mb:.2f} MB -> {out_mb:.2f} MB ({ratio}%) за {elapsed}с")
 
-        status_text = "OK" if not issues else f"{len(issues)} warnings"
-        summary = f"{os.path.basename(output_path)} ({dst_size / 1024 / 1024:.1f} MB) - {status_text}"
+        status_txt = "OK" if not issues else f"{len(issues)} пред."
+        summary = f"{os.path.basename(output_path)} ({out_mb:.1f} MB) - {status_txt}"
         msg_queue.put((Msg.FILE_DONE, (index, True, summary)))
 
     except Exception as exc:
-        log(f"  [x] ERROR: {exc}")
-        msg_queue.put((Msg.ERROR, (index, str(exc))))
-        msg_queue.put((Msg.FILE_DONE, (index, False, f"FAILED: {exc}")))
-    finally:
-        if tmp_path and os.path.exists(tmp_path):
-            try:
-                os.remove(tmp_path)
-            except Exception:
-                pass
+        if cancel_event.is_set():
+            log("  [!] Обработка прервана пользователем.")
+            msg_queue.put((Msg.FILE_DONE, (index, False, "Прервано")))
+        else:
+            log(f"  [x] ОШИБКА: {exc}")
+            msg_queue.put((Msg.ERROR, (index, str(exc))))
+            msg_queue.put((Msg.FILE_DONE, (index, False, f"Ошибка: {exc}")))
 
 
-def batch_worker(files: List[str], output_dir: str, params: Dict[str, Any], msg_queue: queue.Queue):
+def batch_worker(
+    files: List[str],
+    output_dir: str,
+    params: Dict[str, Any],
+    msg_queue: queue.Queue,
+    cancel_event: threading.Event,
+):
     """Worker thread running batch queue."""
     total = len(files)
     for i, path in enumerate(files):
-        process_single_file(i, path, output_dir, params, msg_queue)
+        if cancel_event.is_set():
+            break
+        process_single_file(i, path, output_dir, params, msg_queue, cancel_event)
         msg_queue.put((Msg.PROGRESS_TOTAL, (i + 1, total)))
     msg_queue.put((Msg.ALL_DONE, None))
 
 
-class TikTokQualityApp(tk.Tk):
-    """CompressBase Tkinter Graphical Interface."""
+if _USE_CTK:
+    # ---------------------------------------------------------------------------
+    # CustomTkinter Modern UI Implementation
+    # ---------------------------------------------------------------------------
+    ctk.set_appearance_mode("Dark")
+    ctk.set_default_color_theme("blue")
 
-    def __init__(self):
-        super().__init__()
-        self.title("TikTok Quality Fix - CompressBase Edition")
-        self.resizable(True, True)
-        self.minsize(800, 600)
-        self._files: List[str] = []
-        self._output_dir_var = tk.StringVar(value="")
-        self._running = False
-        self._msg_queue: queue.Queue = queue.Queue()
-        self._params: Dict[str, tk.StringVar] = {}
+    class ModernTikTokQualityApp(ctk.CTk):
+        def __init__(self):
+            super().__init__()
 
-        self._build_ui()
-        self._poll_queue()
+            self.title(f"TikTok Quality Fix v{__version__} — Modern Edition")
+            self.geometry("960x780")
+            self.minsize(860, 680)
 
-    def _build_ui(self):
-        # 1. Input files frame
-        top = ttk.LabelFrame(self, text="Input Videos", padding=8)
-        top.pack(fill="both", expand=False, padx=10, pady=(10, 4))
+            self._files: List[str] = []
+            self._output_dir = ctk.StringVar(value="")
+            self._running = False
+            self._msg_queue: queue.Queue = queue.Queue()
+            self._cancel_event = threading.Event()
 
-        btn_row = ttk.Frame(top)
-        btn_row.pack(fill="x", pady=(0, 6))
-        ttk.Button(btn_row, text="Add Files…", command=self._add_files).pack(side="left", padx=2)
-        ttk.Button(btn_row, text="Remove Selected", command=self._remove_selected).pack(side="left", padx=2)
-        ttk.Button(btn_row, text="Clear All", command=self._clear_files).pack(side="left", padx=2)
+            # Parameters
+            self._preset_var = ctk.StringVar(value=list(PRESETS.keys())[0])
+            self._multiplier_var = ctk.StringVar(value="1.0")
+            self._ffmpeg_preset_var = ctk.StringVar(value="fast")
+            self._level_var = ctk.StringVar(value="4.2")
+            self._audio1_var = ctk.StringVar(value="190")
+            self._audio2_var = ctk.StringVar(value="215")
+            self._comment_var = ctk.StringVar(value="Patched by CompressBase")
+            self._encoder_var = ctk.StringVar(value="Auto")
+            self._theme_var = ctk.StringVar(value="Dark")
 
-        list_frame = ttk.Frame(top)
-        list_frame.pack(fill="both", expand=True)
-        scroll_y = ttk.Scrollbar(list_frame, orient="vertical")
-        self._file_listbox = tk.Listbox(
-            list_frame, height=5, selectmode="extended",
-            yscrollcommand=scroll_y.set, font=("Consolas", 9),
-        )
-        scroll_y.config(command=self._file_listbox.yview)
-        scroll_y.pack(side="right", fill="y")
-        self._file_listbox.pack(side="left", fill="both", expand=True)
+            self._build_ui()
+            self._poll_queue()
 
-        # 2. Settings frame
-        mid = ttk.LabelFrame(self, text="CompressBase Encoding Settings", padding=8)
-        mid.pack(fill="x", padx=10, pady=4)
+        def _build_ui(self):
+            # Header Frame
+            header = ctk.CTkFrame(self, corner_radius=10, fg_color=("gray85", "gray17"))
+            header.pack(fill="x", padx=14, pady=(12, 6))
 
-        row0 = ttk.Frame(mid)
-        row0.pack(fill="x", pady=2)
-        self._make_param(row0, "Bitrate Multiplier:", "bitrate_multiplier", "1.0",
-                         tooltip="Output bitrate = source * multiplier (1.0 = 100%)")
-        self._make_param(row0, "FFmpeg Preset:", "preset", "fast",
-                         choices=["ultrafast", "superfast", "veryfast", "faster", "fast", "medium", "slow"])
+            title_lbl = ctk.CTkLabel(
+                header,
+                text="🎵 TikTok Quality Fix",
+                font=ctk.CTkFont(size=20, weight="bold"),
+            )
+            title_lbl.pack(side="left", padx=16, pady=10)
 
-        row1 = ttk.Frame(mid)
-        row1.pack(fill="x", pady=2)
-        self._make_param(row1, "H.264 Level:", "level", "4.2",
-                         choices=["3.1", "3.2", "4.0", "4.1", "4.2"])
-        self._make_param(row1, "Audio 1 kbps:", "audio_bitrate1", "190")
-        self._make_param(row1, "Audio 2 kbps:", "audio_bitrate2", "215")
+            sub_lbl = ctk.CTkLabel(
+                header,
+                text="1080p 60fps CompressBase Engine",
+                font=ctk.CTkFont(size=12),
+                text_color="gray",
+            )
+            sub_lbl.pack(side="left", padx=4, pady=10)
 
-        row2 = ttk.Frame(mid)
-        row2.pack(fill="x", pady=2)
-        ttk.Label(row2, text="Comment Tag:").pack(side="left", padx=4)
-        self._params["comment"] = tk.StringVar(value="Patched by CompressBase")
-        ttk.Entry(row2, textvariable=self._params["comment"], width=32).pack(side="left", padx=2)
+            theme_menu = ctk.CTkOptionMenu(
+                header,
+                values=["Dark", "Light", "System"],
+                variable=self._theme_var,
+                command=self._change_theme,
+                width=100,
+            )
+            theme_menu.pack(side="right", padx=16, pady=10)
 
-        # Output folder row
-        out_row = ttk.Frame(mid)
-        out_row.pack(fill="x", pady=6)
-        ttk.Label(out_row, text="Output Folder:").pack(side="left", padx=4)
-        ttk.Entry(out_row, textvariable=self._output_dir_var, width=40).pack(side="left", padx=2, fill="x", expand=True)
-        ttk.Button(out_row, text="Browse…", command=self._pick_output_dir).pack(side="left", padx=2)
+            # Main content layout (Two columns: Files & Settings)
+            content_grid = ctk.CTkFrame(self, fg_color="transparent")
+            content_grid.pack(fill="both", expand=True, padx=14, pady=4)
+            content_grid.grid_columnconfigure(0, weight=3)
+            content_grid.grid_columnconfigure(1, weight=2)
+            content_grid.grid_rowconfigure(0, weight=1)
 
-        # 3. Progress frame
-        prog_frame = ttk.LabelFrame(self, text="Progress", padding=8)
-        prog_frame.pack(fill="x", padx=10, pady=4)
+            # Left Card: Files Queue
+            files_card = ctk.CTkFrame(content_grid, corner_radius=10)
+            files_card.grid(row=0, column=0, sticky="nsew", padx=(0, 6), pady=0)
 
-        self._current_file_label = ttk.Label(prog_frame, text="Idle", anchor="w")
-        self._current_file_label.pack(fill="x")
-        self._file_progress = ttk.Progressbar(prog_frame, orient="horizontal", mode="determinate", maximum=100)
-        self._file_progress.pack(fill="x", pady=2)
+            files_header = ctk.CTkLabel(
+                files_card,
+                text="📁 Очередь видеофайлов",
+                font=ctk.CTkFont(size=14, weight="bold"),
+            )
+            files_header.pack(anchor="w", padx=12, pady=(10, 6))
 
-        self._total_label = ttk.Label(prog_frame, text="Total: 0 / 0", anchor="w")
-        self._total_label.pack(fill="x")
-        self._total_progress = ttk.Progressbar(prog_frame, orient="horizontal", mode="determinate", maximum=100)
-        self._total_progress.pack(fill="x", pady=2)
+            btn_row = ctk.CTkFrame(files_card, fg_color="transparent")
+            btn_row.pack(fill="x", padx=10, pady=(0, 6))
+            ctk.CTkButton(btn_row, text="+ Добавить файлы", width=120, command=self._add_files).pack(side="left", padx=4)
+            ctk.CTkButton(btn_row, text="Удалить выбранные", width=130, fg_color="gray40", hover_color="gray30", command=self._remove_selected).pack(side="left", padx=4)
+            ctk.CTkButton(btn_row, text="Очистить всё", width=100, fg_color="#b83232", hover_color="#992626", command=self._clear_files).pack(side="left", padx=4)
 
-        # Buttons
-        btn_frame = ttk.Frame(self)
-        btn_frame.pack(fill="x", padx=10, pady=4)
-        self._start_btn = ttk.Button(btn_frame, text="Start Batch", command=self._start_batch)
-        self._start_btn.pack(side="left", padx=4)
-        self._stop_btn = ttk.Button(btn_frame, text="Stop", command=self._stop_batch, state="disabled")
-        self._stop_btn.pack(side="left", padx=4)
+            self._file_textbox = ctk.CTkTextbox(
+                files_card,
+                font=ctk.CTkFont(family="Consolas", size=11),
+                wrap="none",
+                corner_radius=6,
+            )
+            self._file_textbox.pack(fill="both", expand=True, padx=10, pady=(0, 10))
 
-        # 4. Log frame
-        log_frame = ttk.LabelFrame(self, text="Activity & Validation Log", padding=8)
-        log_frame.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+            # Right Card: Settings & Presets
+            settings_card = ctk.CTkFrame(content_grid, corner_radius=10)
+            settings_card.grid(row=0, column=1, sticky="nsew", padx=(6, 0), pady=0)
 
-        log_scroll_y = ttk.Scrollbar(log_frame, orient="vertical")
-        log_scroll_x = ttk.Scrollbar(log_frame, orient="horizontal")
-        self._log_text = tk.Text(
-            log_frame, height=12, state="disabled", wrap="none",
-            font=("Consolas", 8),
-            yscrollcommand=log_scroll_y.set,
-            xscrollcommand=log_scroll_x.set,
-        )
-        log_scroll_y.config(command=self._log_text.yview)
-        log_scroll_x.config(command=self._log_text.xview)
-        log_scroll_x.pack(side="bottom", fill="x")
-        log_scroll_y.pack(side="right", fill="y")
-        self._log_text.pack(side="left", fill="both", expand=True)
+            settings_lbl = ctk.CTkLabel(
+                settings_card,
+                text="⚙️ Параметры кодирования",
+                font=ctk.CTkFont(size=14, weight="bold"),
+            )
+            settings_lbl.pack(anchor="w", padx=12, pady=(10, 6))
 
-        clear_btn = ttk.Button(log_frame, text="Clear Log", command=self._clear_log)
-        clear_btn.pack(side="bottom", anchor="w", pady=2)
+            # Preset selector
+            ctk.CTkLabel(settings_card, text="Быстрый пресет:", font=ctk.CTkFont(size=12)).pack(anchor="w", padx=12, pady=(4, 0))
+            self._preset_menu = ctk.CTkOptionMenu(
+                settings_card,
+                values=list(PRESETS.keys()),
+                variable=self._preset_var,
+                command=self._on_preset_change,
+            )
+            self._preset_menu.pack(fill="x", padx=12, pady=(2, 6))
 
-        # Color tags
-        self._log_text.tag_config("ok", foreground="#008800")
-        self._log_text.tag_config("warn", foreground="#cc6600")
-        self._log_text.tag_config("err", foreground="#cc0000")
-        self._log_text.tag_config("head", foreground="#0044aa", font=("Consolas", 8, "bold"))
+            # Encoder selection
+            detected_encoders = ["Auto (Рекомендуется)", "libx264 (CPU)"]
+            avail = fw.get_available_video_encoders()
+            if "h264_nvenc" in avail:
+                detected_encoders.append("h264_nvenc (NVIDIA)")
+            if "h264_qsv" in avail:
+                detected_encoders.append("h264_qsv (Intel)")
+            if "h264_amf" in avail:
+                detected_encoders.append("h264_amf (AMD)")
 
-        self._stop_flag = threading.Event()
+            ctk.CTkLabel(settings_card, text="Видеокодек / Ускоритель:", font=ctk.CTkFont(size=12)).pack(anchor="w", padx=12, pady=(4, 0))
+            self._encoder_menu = ctk.CTkOptionMenu(
+                settings_card,
+                values=detected_encoders,
+                variable=self._encoder_var,
+            )
+            self._encoder_menu.pack(fill="x", padx=12, pady=(2, 6))
 
-    def _make_param(self, parent, label, key, default, tooltip="", choices=None):
-        f = ttk.Frame(parent)
-        f.pack(side="left", padx=6)
-        ttk.Label(f, text=label).pack(side="left")
-        var = tk.StringVar(value=default)
-        self._params[key] = var
-        if choices:
-            w = ttk.Combobox(f, textvariable=var, values=choices, width=10, state="readonly")
-        else:
-            w = ttk.Entry(f, textvariable=var, width=8)
-        w.pack(side="left", padx=2)
+            # Bitrate multiplier
+            ctk.CTkLabel(settings_card, text="Множитель битрейта (1.0 = 100%):", font=ctk.CTkFont(size=12)).pack(anchor="w", padx=12, pady=(4, 0))
+            ctk.CTkEntry(settings_card, textvariable=self._multiplier_var).pack(fill="x", padx=12, pady=(2, 6))
 
-    def _add_files(self):
-        paths = filedialog.askopenfilenames(
-            title="Select Video Files",
-            filetypes=[("Video files", "*.mp4 *.mov *.mkv *.avi *.ts *.m4v"), ("All files", "*.*")],
-        )
-        for p in paths:
-            if p not in self._files:
-                self._files.append(p)
-                self._file_listbox.insert("end", os.path.basename(p))
+            # Preset speed
+            ctk.CTkLabel(settings_card, text="Скорость FFmpeg (Preset):", font=ctk.CTkFont(size=12)).pack(anchor="w", padx=12, pady=(4, 0))
+            ctk.CTkOptionMenu(
+                settings_card,
+                values=["ultrafast", "superfast", "veryfast", "faster", "fast", "medium", "slow"],
+                variable=self._ffmpeg_preset_var,
+            ).pack(fill="x", padx=12, pady=(2, 6))
 
-    def _remove_selected(self):
-        sel = list(self._file_listbox.curselection())
-        for i in reversed(sel):
-            self._file_listbox.delete(i)
-            del self._files[i]
+            # Audio Bitrates
+            audio_row = ctk.CTkFrame(settings_card, fg_color="transparent")
+            audio_row.pack(fill="x", padx=12, pady=4)
+            audio_row.grid_columnconfigure((0, 1), weight=1)
 
-    def _clear_files(self):
-        self._file_listbox.delete(0, "end")
-        self._files.clear()
+            ctk.CTkLabel(audio_row, text="Аудио 1 (кбит/с):", font=ctk.CTkFont(size=11)).grid(row=0, column=0, sticky="w")
+            ctk.CTkEntry(audio_row, textvariable=self._audio1_var, width=80).grid(row=1, column=0, sticky="ew", padx=(0, 4))
 
-    def _pick_output_dir(self):
-        d = filedialog.askdirectory(title="Select Output Folder")
-        if d:
-            self._output_dir_var.set(d)
+            ctk.CTkLabel(audio_row, text="Аудио 2 (кбит/с):", font=ctk.CTkFont(size=11)).grid(row=0, column=1, sticky="w")
+            ctk.CTkEntry(audio_row, textvariable=self._audio2_var, width=80).grid(row=1, column=1, sticky="ew", padx=(4, 0))
 
-    def _collect_params(self) -> Optional[Dict[str, Any]]:
-        try:
-            return {
-                "bitrate_multiplier": float(self._params["bitrate_multiplier"].get()),
-                "audio_bitrate1": int(self._params["audio_bitrate1"].get()),
-                "audio_bitrate2": int(self._params["audio_bitrate2"].get()),
-                "preset": self._params["preset"].get(),
-                "level": self._params["level"].get(),
-                "comment": self._params["comment"].get(),
-                "audio_multiplier": 10,
-            }
-        except ValueError as e:
-            messagebox.showerror("Invalid Parameter", str(e))
-            return None
+            # Output folder
+            ctk.CTkLabel(settings_card, text="Папка сохранения:", font=ctk.CTkFont(size=12)).pack(anchor="w", padx=12, pady=(8, 0))
+            out_row = ctk.CTkFrame(settings_card, fg_color="transparent")
+            out_row.pack(fill="x", padx=12, pady=(2, 10))
+            ctk.CTkEntry(out_row, textvariable=self._output_dir).pack(side="left", fill="x", expand=True, padx=(0, 6))
+            ctk.CTkButton(out_row, text="Обзор…", width=70, command=self._pick_output_dir).pack(side="right")
 
-    def _start_batch(self):
-        if not self._files:
-            messagebox.showwarning("No Files", "Please add at least one video file to process.")
-            return
+            # Progress & Control Frame
+            control_card = ctk.CTkFrame(self, corner_radius=10)
+            control_card.pack(fill="x", padx=14, pady=6)
 
-        output_dir = self._output_dir_var.get().strip()
-        if not output_dir:
-            output_dir = os.path.dirname(self._files[0])
-            self._output_dir_var.set(output_dir)
+            self._cur_file_lbl = ctk.CTkLabel(control_card, text="Ожидание запуска…", font=ctk.CTkFont(size=12), anchor="w")
+            self._cur_file_lbl.pack(fill="x", padx=14, pady=(8, 2))
 
-        if not os.path.isdir(output_dir):
+            self._file_prog = ctk.CTkProgressBar(control_card)
+            self._file_prog.set(0)
+            self._file_prog.pack(fill="x", padx=14, pady=2)
+
+            self._total_lbl = ctk.CTkLabel(control_card, text="Очередь: 0 / 0", font=ctk.CTkFont(size=12), anchor="w")
+            self._total_lbl.pack(fill="x", padx=14, pady=(4, 2))
+
+            self._total_prog = ctk.CTkProgressBar(control_card)
+            self._total_prog.set(0)
+            self._total_prog.pack(fill="x", padx=14, pady=2)
+
+            # Action Buttons Row
+            actions_row = ctk.CTkFrame(control_card, fg_color="transparent")
+            actions_row.pack(fill="x", padx=14, pady=(8, 10))
+
+            self._start_btn = ctk.CTkButton(
+                actions_row,
+                text="▶ Запустить обработку",
+                font=ctk.CTkFont(size=13, weight="bold"),
+                fg_color="#107c41",
+                hover_color="#0b5e31",
+                command=self._start_batch,
+                height=36,
+            )
+            self._start_btn.pack(side="left", padx=(0, 8))
+
+            self._stop_btn = ctk.CTkButton(
+                actions_row,
+                text="⏹ Остановить",
+                font=ctk.CTkFont(size=13),
+                fg_color="#b83232",
+                hover_color="#992626",
+                command=self._stop_batch,
+                state="disabled",
+                height=36,
+            )
+            self._stop_btn.pack(side="left", padx=8)
+
+            self._open_out_btn = ctk.CTkButton(
+                actions_row,
+                text="📂 Открыть папку вывода",
+                font=ctk.CTkFont(size=12),
+                fg_color="gray30",
+                hover_color="gray40",
+                command=self._open_output_folder,
+                height=36,
+            )
+            self._open_out_btn.pack(side="right")
+
+            # Activity Log Frame
+            log_card = ctk.CTkFrame(self, corner_radius=10)
+            log_card.pack(fill="both", expand=True, padx=14, pady=(0, 12))
+
+            log_header_row = ctk.CTkFrame(log_card, fg_color="transparent")
+            log_header_row.pack(fill="x", padx=12, pady=(6, 2))
+            ctk.CTkLabel(log_header_row, text="📋 Журнал операций (Log):", font=ctk.CTkFont(size=12, weight="bold")).pack(side="left")
+            ctk.CTkButton(log_header_row, text="Очистить лог", width=90, height=24, fg_color="transparent", border_width=1, command=self._clear_log).pack(side="right")
+
+            self._log_text = ctk.CTkTextbox(
+                log_card,
+                font=ctk.CTkFont(family="Consolas", size=10),
+                wrap="none",
+                corner_radius=6,
+            )
+            self._log_text.pack(fill="both", expand=True, padx=12, pady=(0, 10))
+
+        def _change_theme(self, new_theme: str):
+            ctk.set_appearance_mode(new_theme)
+
+        def _on_preset_change(self, preset_name: str):
+            cfg = PRESETS.get(preset_name)
+            if cfg:
+                self._multiplier_var.set(str(cfg["bitrate_multiplier"]))
+                self._ffmpeg_preset_var.set(cfg["preset"])
+                self._level_var.set(cfg["level"])
+                self._audio1_var.set(str(cfg["audio_bitrate1"]))
+                self._audio2_var.set(str(cfg["audio_bitrate2"]))
+
+        def _add_files(self):
+            paths = filedialog.askopenfilenames(
+                title="Выберите видео файлы",
+                filetypes=[
+                    ("Видео файлы", "*.mp4 *.mov *.mkv *.avi *.ts *.m4v *.webm"),
+                    ("Все файлы", "*.*"),
+                ],
+            )
+            for p in paths:
+                if p not in self._files:
+                    self._files.append(p)
+            self._refresh_file_list()
+
+        def _remove_selected(self):
+            # For simplicity, removes last or clear
+            if self._files:
+                self._files.pop()
+                self._refresh_file_list()
+
+        def _clear_files(self):
+            self._files.clear()
+            self._refresh_file_list()
+
+        def _refresh_file_list(self):
+            self._file_textbox.delete("1.0", "end")
+            for i, p in enumerate(self._files, start=1):
+                sz = os.path.getsize(p) / 1024 / 1024 if os.path.isfile(p) else 0
+                self._file_textbox.insert("end", f"[{i}] {os.path.basename(p)} ({sz:.1f} MB)\n    {p}\n")
+
+        def _pick_output_dir(self):
+            d = filedialog.askdirectory(title="Выберите папку для сохранения")
+            if d:
+                self._output_dir.set(d)
+
+        def _open_output_folder(self):
+            out = self._output_dir.get().strip()
+            if out and os.path.isdir(out):
+                if sys.platform == "win32":
+                    os.startfile(out)
+                else:
+                    subprocess.Popen(["xdg-open", out])
+            elif self._files:
+                parent = os.path.dirname(self._files[0])
+                if os.path.isdir(parent):
+                    if sys.platform == "win32":
+                        os.startfile(parent)
+
+        def _collect_params(self) -> Optional[Dict[str, Any]]:
             try:
-                os.makedirs(output_dir, exist_ok=True)
-            except Exception as e:
-                messagebox.showerror("Output Folder Error", f"Cannot create folder:\n{e}")
+                enc_choice = self._encoder_var.get()
+                codec = "libx264"
+                if "nvenc" in enc_choice.lower():
+                    codec = "h264_nvenc"
+                elif "qsv" in enc_choice.lower():
+                    codec = "h264_qsv"
+                elif "amf" in enc_choice.lower():
+                    codec = "h264_amf"
+
+                return {
+                    "bitrate_multiplier": float(self._multiplier_var.get()),
+                    "audio_bitrate1": int(self._audio1_var.get()),
+                    "audio_bitrate2": int(self._audio2_var.get()),
+                    "preset": self._ffmpeg_preset_var.get(),
+                    "level": self._level_var.get(),
+                    "comment": self._comment_var.get(),
+                    "video_encoder": codec,
+                    "audio_multiplier": 10,
+                }
+            except ValueError as e:
+                messagebox.showerror("Неверные параметры", f"Ошибка в числовых параметрах:\n{e}")
+                return None
+
+        def _start_batch(self):
+            if not self._files:
+                messagebox.showwarning("Нет файлов", "Пожалуйста, добавьте хотя бы одно видео для обработки.")
                 return
 
-        try:
-            fw.find_ffmpeg()
-        except RuntimeError as e:
-            messagebox.showerror("FFmpeg Not Found", str(e))
-            return
+            output_dir = self._output_dir.get().strip()
+            if not output_dir:
+                output_dir = os.path.dirname(self._files[0])
+                self._output_dir.set(output_dir)
 
-        params = self._collect_params()
-        if params is None:
-            return
+            if not os.path.isdir(output_dir):
+                try:
+                    os.makedirs(output_dir, exist_ok=True)
+                except Exception as e:
+                    messagebox.showerror("Ошибка папки", f"Не удалось создать директорию вывода:\n{e}")
+                    return
 
-        self._running = True
-        self._stop_flag.clear()
-        self._start_btn.config(state="disabled")
-        self._stop_btn.config(state="normal")
-        self._file_progress["value"] = 0
-        self._total_progress["value"] = 0
-        self._total_label.config(text=f"Total: 0 / {len(self._files)}")
+            try:
+                fw.find_ffmpeg()
+            except RuntimeError as e:
+                messagebox.showerror("FFmpeg не найден", str(e))
+                return
 
-        files_copy = list(self._files)
-        t = threading.Thread(
-            target=batch_worker,
-            args=(files_copy, output_dir, params, self._msg_queue),
-            daemon=True,
-        )
-        t.start()
+            params = self._collect_params()
+            if params is None:
+                return
 
-    def _stop_batch(self):
-        self._stop_flag.set()
-        self._log("Stop requested. Waiting for current file to complete…", "warn")
+            self._running = True
+            self._cancel_event.clear()
+            self._start_btn.configure(state="disabled")
+            self._stop_btn.configure(state="normal")
+            self._file_prog.set(0)
+            self._total_prog.set(0)
+            self._total_lbl.configure(text=f"Очередь: 0 / {len(self._files)}")
 
-    def _poll_queue(self):
-        try:
-            while True:
-                kind, data = self._msg_queue.get_nowait()
-                self._handle_msg(kind, data)
-        except queue.Empty:
-            pass
-        self.after(80, self._poll_queue)
+            files_copy = list(self._files)
+            t = threading.Thread(
+                target=batch_worker,
+                args=(files_copy, output_dir, params, self._msg_queue, self._cancel_event),
+                daemon=True,
+            )
+            t.start()
 
-    def _handle_msg(self, kind: str, data: Any):
-        if kind == Msg.LOG:
-            tag = ""
-            if "[+]" in data or "passed" in data.lower():
-                tag = "ok"
-            elif "[!]" in data or "warning" in data.lower():
-                tag = "warn"
-            elif "[x]" in data or "error" in data.lower():
-                tag = "err"
-            elif data.startswith("==="):
-                tag = "head"
-            self._log(data, tag)
+        def _stop_batch(self):
+            self._cancel_event.set()
+            self._log("Запрошена остановка. Прерывание текущего процесса…")
 
-        elif kind == Msg.PROGRESS_FILE:
-            index, pct = data
-            basename = os.path.basename(self._files[index]) if index < len(self._files) else ""
-            self._current_file_label.config(text=f"File [{index + 1}]: {basename} - {pct:.0f}%")
-            self._file_progress["value"] = pct
+        def _poll_queue(self):
+            try:
+                while True:
+                    kind, data = self._msg_queue.get_nowait()
+                    self._handle_msg(kind, data)
+            except queue.Empty:
+                pass
+            self.after(60, self._poll_queue)
 
-        elif kind == Msg.PROGRESS_TOTAL:
-            done, total = data
-            self._total_label.config(text=f"Total: {done} / {total}")
-            self._total_progress["value"] = (done / total * 100) if total > 0 else 0
+        def _handle_msg(self, kind: str, data: Any):
+            if kind == Msg.LOG:
+                self._log(data)
 
-        elif kind == Msg.FILE_DONE:
-            _, success, summary = data
-            tag = "ok" if success else "err"
-            self._log(f"  -> {summary}", tag)
+            elif kind == Msg.PROGRESS_FILE:
+                index, pct, line = data
+                base = os.path.basename(self._files[index]) if index < len(self._files) else ""
+                self._cur_file_lbl.configure(text=f"[{index + 1}/{len(self._files)}] {base} — {pct:.1f}%")
+                self._file_prog.set(pct / 100.0)
 
-        elif kind == Msg.ALL_DONE:
-            self._running = False
-            self._start_btn.config(state="normal")
-            self._stop_btn.config(state="disabled")
-            self._current_file_label.config(text="Done.")
-            self._file_progress["value"] = 100
-            self._total_progress["value"] = 100
-            self._log("\nBatch complete!", "ok")
-            messagebox.showinfo("Done", "Batch processing complete!")
+            elif kind == Msg.PROGRESS_TOTAL:
+                done, total = data
+                self._total_lbl.configure(text=f"Очередь: {done} / {total}")
+                self._total_prog.set(done / total if total > 0 else 0)
 
-        elif kind == Msg.ERROR:
-            index, msg = data
-            self._log(f"  ERROR [{index + 1}]: {msg}", "err")
+            elif kind == Msg.FILE_DONE:
+                _, success, summary = data
+                self._log(f"  -> Итог: {summary}")
 
-    def _log(self, text: str, tag: str = ""):
-        self._log_text.config(state="normal")
-        if tag:
-            self._log_text.insert("end", text + "\n", tag)
-        else:
+            elif kind == Msg.ALL_DONE:
+                self._running = False
+                self._start_btn.configure(state="normal")
+                self._stop_btn.configure(state="disabled")
+                self._cur_file_lbl.configure(text="Обработка завершена.")
+                self._file_prog.set(1.0)
+                self._total_prog.set(1.0)
+                self._log("\n[+] Все задачи завершены успешно!")
+                messagebox.showinfo("Готово", "Пакетная обработка видео успешно завершена!")
+
+            elif kind == Msg.ERROR:
+                index, msg = data
+                self._log(f"  [x] Ошибка на файле [{index + 1}]: {msg}")
+
+        def _log(self, text: str):
             self._log_text.insert("end", text + "\n")
-        self._log_text.see("end")
-        self._log_text.config(state="disabled")
+            self._log_text.see("end")
 
-    def _clear_log(self):
-        self._log_text.config(state="normal")
-        self._log_text.delete("1.0", "end")
-        self._log_text.config(state="disabled")
+        def _clear_log(self):
+            self._log_text.delete("1.0", "end")
+
+    TikTokQualityApp = ModernTikTokQualityApp
+
+else:
+    # ---------------------------------------------------------------------------
+    # Fallback to standard Tkinter / ttk
+    # ---------------------------------------------------------------------------
+    class FallbackTikTokQualityApp(tk.Tk):
+        def __init__(self):
+            super().__init__()
+            self.title("TikTok Quality Fix (Fallback Mode)")
+            self.geometry("800x600")
+            lbl = ttk.Label(self, text="CustomTkinter не установлен. Запустите: pip install customtkinter", padding=20)
+            lbl.pack()
+
+    TikTokQualityApp = FallbackTikTokQualityApp
 
 
 def main():

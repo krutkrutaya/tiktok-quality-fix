@@ -21,7 +21,13 @@ from pathlib import Path
 
 from . import __version__
 from .compressbase import process_video
-from .encoder import probe, format_probe_summary, find_ffmpeg
+from .encoder import (
+    probe,
+    format_probe_summary,
+    find_ffmpeg,
+    get_available_video_encoders,
+    set_custom_ffmpeg_paths,
+)
 from .validator import validate_output, load_target_spec
 from .transform import transform
 from .randomize import RandomOptions
@@ -38,10 +44,13 @@ Examples:
   # Standard CompressBase processing (Recommended):
   tiktok-quality input.mp4 output.mp4
 
-  # Custom bitrates and preset:
-  tiktok-quality input.mp4 output.mp4 --bitrate-multiplier 0.9 --preset slow
+  # Hardware accelerated encoding (NVIDIA NVENC, Intel QSV, AMD AMF):
+  tiktok-quality input.mp4 output.mp4 --encoder h264_nvenc
 
-  # Launch Graphical User Interface (GUI):
+  # Custom bitrates and preset:
+  tiktok-quality input.mp4 output.mp4 --bitrate-multiplier 1.1 --preset slow
+
+  # Launch Graphical User Interface (Modern CustomTkinter GUI):
   tiktok-quality --gui
 
   # Legacy container manipulation (ghost-frames without re-encoding):
@@ -50,15 +59,21 @@ Examples:
   # Inspect / Verify an existing MP4 file:
   tiktok-quality --verify output.mp4
 
-  # Check FFmpeg and system dependencies:
+  # Check FFmpeg, hardware encoders, and system dependencies:
   tiktok-quality --check-deps
         """,
     )
     parser.add_argument("input", nargs="?", help="Input video file path")
     parser.add_argument("output", nargs="?", help="Output video file path")
-    parser.add_argument("--gui", action="store_true", help="Launch Tkinter GUI application")
+    parser.add_argument("--gui", action="store_true", help="Launch Modern CustomTkinter GUI application")
 
     # CompressBase parameters
+    parser.add_argument(
+        "--encoder",
+        type=str,
+        default="auto",
+        help="Video encoder (auto, libx264, h264_nvenc, h264_qsv, h264_amf)",
+    )
     parser.add_argument(
         "--bitrate-multiplier",
         type=float,
@@ -104,6 +119,18 @@ Examples:
         default=10,
         help="Sample/frame inflation multiplier (default: 10)",
     )
+    parser.add_argument(
+        "--ffmpeg-path",
+        type=str,
+        default=None,
+        help="Explicit path to ffmpeg executable",
+    )
+    parser.add_argument(
+        "--ffprobe-path",
+        type=str,
+        default=None,
+        help="Explicit path to ffprobe executable",
+    )
 
     # Legacy ghost frame mode
     parser.add_argument(
@@ -143,7 +170,7 @@ Examples:
     parser.add_argument(
         "--check-deps",
         action="store_true",
-        help="Check FFmpeg and Python dependencies",
+        help="Check FFmpeg, hardware encoders, and Python dependencies",
     )
     parser.add_argument(
         "-q",
@@ -159,6 +186,9 @@ Examples:
     )
 
     args = parser.parse_args()
+
+    if args.ffmpeg_path or args.ffprobe_path:
+        set_custom_ffmpeg_paths(args.ffmpeg_path, args.ffprobe_path)
 
     if args.gui:
         from .gui import main as gui_main
@@ -216,9 +246,17 @@ Examples:
 
         def cli_progress(percent: float, line: str):
             if not args.quiet:
-                # Progress update
                 sys.stdout.write(f"\r[*] Encoding: {percent:5.1f}%")
                 sys.stdout.flush()
+
+        chosen_encoder = args.encoder
+        if chosen_encoder.lower() == "auto":
+            avail = get_available_video_encoders()
+            chosen_encoder = "libx264"
+            if "h264_nvenc" in avail:
+                chosen_encoder = "h264_nvenc"
+            elif "h264_qsv" in avail:
+                chosen_encoder = "h264_qsv"
 
         try:
             result = process_video(
@@ -231,6 +269,7 @@ Examples:
                 level=args.level,
                 comment=args.comment,
                 audio_multiplier=args.multiplier,
+                video_encoder=chosen_encoder,
                 progress_callback=cli_progress if not args.quiet else None,
             )
             if not args.quiet:
@@ -243,9 +282,10 @@ Examples:
                     for iss in val_info["issues"]:
                         print(f"    - {iss}")
 
-                src_sz = os.path.getsize(args.input)
+                src_sz = result["sourceSizeBytes"]
                 out_sz = result["sizeBytes"]
-                print(f"[+] Output size: {out_sz / 1024 / 1024:.2f} MB (from {src_sz / 1024 / 1024:.2f} MB)")
+                elapsed = result["elapsedSeconds"]
+                print(f"[+] Output size: {out_sz / 1024 / 1024:.2f} MB (from {src_sz / 1024 / 1024:.2f} MB) in {elapsed}s")
         except Exception as e:
             print(f"\n[!] Error during processing: {e}", file=sys.stderr)
             sys.exit(1)
@@ -348,8 +388,16 @@ def _check_deps():
         ff, fp = find_ffmpeg()
         print(f"[+] ffmpeg:  {ff}")
         print(f"[+] ffprobe: {fp}")
+        encoders = get_available_video_encoders()
+        print(f"[+] Available H.264 video encoders: {', '.join(encoders)}")
     except RuntimeError as e:
         print(f"[!] FFmpeg status: {e}")
+
+    try:
+        import customtkinter
+        print(f"[+] CustomTkinter v{customtkinter.__version__} (Modern GUI available)")
+    except ImportError:
+        print("[-] CustomTkinter not installed (Standard Tkinter fallback mode)")
 
     try:
         import tiktok_quality

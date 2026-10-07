@@ -5,12 +5,12 @@ build-backend = "hatchling.build"
 [project]
 name = "tiktok-quality-fix"
 version = "2.0.0"
-description = "Upload 1080p 60fps on TikTok using CompressBase method"
+description = "Upload 1080p 60fps on TikTok using CompressBase method with Modern CustomTkinter GUI"
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.10"
 authors = [{ name = "krutkrutaya" }]
-keywords = ["tiktok", "mp4", "video", "1080p60", "1080p", "60fps", "upload", "quality", "compressbase", "ffmpeg"]
+keywords = ["tiktok", "mp4", "video", "1080p60", "1080p", "60fps", "upload", "quality", "compressbase", "ffmpeg", "customtkinter"]
 classifiers = [
     "Development Status :: 5 - Production/Stable",
     "Environment :: Console",
@@ -25,6 +25,11 @@ classifiers = [
     "Programming Language :: Python :: 3.14",
     "Topic :: Multimedia :: Video",
     "Topic :: Multimedia :: Video :: Conversion",
+]
+dependencies = [
+    "customtkinter>=6.0.0",
+    "darkdetect>=0.8.0",
+    "packaging>=20.0",
 ]
 
 [project.scripts]

@@ -4,9 +4,10 @@ encoder.py
 Subprocess wrappers for ffmpeg and ffprobe.
 Implements the CompressBase encoding pipeline:
   - Video re-encoding to H.264 Constrained Baseline L4.2 (CBR with HRD buffer, yuv420p)
+  - Hardware acceleration support (NVENC, QSV, AMF) with seamless CPU (libx264) fallback
   - Dual AAC-LC 48kHz stereo tracks generated from a split filtergraph
   - Strip source metadata, set format comment, video encoder tags, faststart
-  - Stream progress callbacks
+  - Stream progress callbacks and graceful cancellation
 """
 
 from __future__ import annotations
@@ -16,29 +17,69 @@ import os
 import re
 import shutil
 import subprocess
-from pathlib import Path
+import threading
 from typing import Callable, Optional, Tuple, List, Dict, Any
+
+_CACHED_FFMPEG: Optional[str] = None
+_CACHED_FFPROBE: Optional[str] = None
+_CACHED_ENCODERS: Optional[List[str]] = None
+
+
+def set_custom_ffmpeg_paths(ffmpeg_path: Optional[str] = None, ffprobe_path: Optional[str] = None) -> None:
+    """Manually configure custom paths for ffmpeg and ffprobe."""
+    global _CACHED_FFMPEG, _CACHED_FFPROBE, _CACHED_ENCODERS
+    if ffmpeg_path and os.path.isfile(ffmpeg_path):
+        _CACHED_FFMPEG = ffmpeg_path
+        _CACHED_ENCODERS = None
+    if ffprobe_path and os.path.isfile(ffprobe_path):
+        _CACHED_FFPROBE = ffprobe_path
 
 
 def find_ffmpeg() -> Tuple[str, str]:
     """
     Return (ffmpeg_path, ffprobe_path).
-    Searches PATH and standard Windows / Linux locations.
+    Searches user overrides, environment variables, PATH, and standard Windows/Linux locations.
     Raises RuntimeError if ffmpeg or ffprobe cannot be found.
     """
-    ff = shutil.which("ffmpeg")
-    fp = shutil.which("ffprobe")
+    global _CACHED_FFMPEG, _CACHED_FFPROBE
 
+    if _CACHED_FFMPEG and _CACHED_FFPROBE and os.path.isfile(_CACHED_FFMPEG) and os.path.isfile(_CACHED_FFPROBE):
+        return _CACHED_FFMPEG, _CACHED_FFPROBE
+
+    # 1. Environment variables
+    ff = os.environ.get("FFMPEG_PATH")
+    fp = os.environ.get("FFPROBE_PATH")
+
+    # 2. System PATH
+    if not ff:
+        ff = shutil.which("ffmpeg")
+    if not fp:
+        fp = shutil.which("ffprobe")
+
+    # 3. Known standard Windows directories
     if not ff or not fp:
-        # Search common Windows paths if not found directly in PATH
         candidate_dirs = [
+            os.path.expandvars(r"%LOCALAPPDATA%\Microsoft\WinGet\Links"),
             os.path.expandvars(r"%LOCALAPPDATA%\Microsoft\WinGet\Packages"),
             os.path.expandvars(r"%ProgramFiles%\ffmpeg\bin"),
+            os.path.expandvars(r"%ProgramFiles(x86)%\ffmpeg\bin"),
             os.path.expandvars(r"%ProgramData%\chocolatey\bin"),
             os.path.expandvars(r"%USERPROFILE%\scoop\shims"),
+            os.path.join(os.path.dirname(__file__), "bin"),
+            os.path.join(os.getcwd(), "bin"),
         ]
         for cdir in candidate_dirs:
             if os.path.isdir(cdir):
+                direct_ff = os.path.join(cdir, "ffmpeg.exe")
+                direct_fp = os.path.join(cdir, "ffprobe.exe")
+                if not ff and os.path.isfile(direct_ff):
+                    ff = direct_ff
+                if not fp and os.path.isfile(direct_fp):
+                    fp = direct_fp
+                if ff and fp:
+                    break
+
+                # Walk one level down for nested package folders
                 for root, _, files in os.walk(cdir):
                     if not ff and "ffmpeg.exe" in files:
                         ff = os.path.join(root, "ffmpeg.exe")
@@ -63,7 +104,31 @@ def find_ffmpeg() -> Tuple[str, str]:
             "Please ensure FFmpeg is properly installed with ffprobe."
         )
 
+    _CACHED_FFMPEG = ff
+    _CACHED_FFPROBE = fp
     return ff, fp
+
+
+def get_available_video_encoders() -> List[str]:
+    """Return list of supported H.264 video encoders reported by ffmpeg."""
+    global _CACHED_ENCODERS
+    if _CACHED_ENCODERS is not None:
+        return _CACHED_ENCODERS
+
+    encoders = ["libx264"]
+    try:
+        ffmpeg_path, _ = find_ffmpeg()
+        res = subprocess.run([ffmpeg_path, "-encoders"], capture_output=True, text=True, errors="replace", timeout=10)
+        stdout = res.stdout.lower()
+        candidates = ["h264_nvenc", "h264_qsv", "h264_amf", "h264_videotoolbox"]
+        for cand in candidates:
+            if cand in stdout and cand not in encoders:
+                encoders.append(cand)
+    except Exception:
+        pass
+
+    _CACHED_ENCODERS = encoders
+    return encoders
 
 
 def probe(file_path: str) -> Dict[str, Any]:
@@ -144,6 +209,7 @@ def build_encode_command(
     comment: str = "Patched by CompressBase",
     encoder_tag: str = "Lavf59.27.100",
     video_encoder_tag: str = "Lavc59.37.100 libx264",
+    video_encoder: str = "libx264",
 ) -> List[str]:
     """
     Build the CompressBase FFmpeg command:
@@ -162,15 +228,52 @@ def build_encode_command(
         "-i", input_path,
         "-filter_complex", filter_complex,
         "-map", "0:v:0",
-        "-c:v", "libx264",
-        "-preset", preset,
-        "-b:v", f"{target_video_bitrate_kbps}k",
-        "-maxrate", f"{target_video_bitrate_kbps}k",
-        "-bufsize", f"{target_video_bitrate_kbps * 2}k",
-        "-pix_fmt", "yuv420p",
-        "-profile:v", "baseline",
-        "-level:v", level,
-        "-x264-params", "nal-hrd=cbr",
+        "-c:v", video_encoder,
+    ]
+
+    # Specific video encoder parameters
+    if video_encoder == "libx264":
+        cmd.extend([
+            "-preset", preset,
+            "-b:v", f"{target_video_bitrate_kbps}k",
+            "-maxrate", f"{target_video_bitrate_kbps}k",
+            "-bufsize", f"{target_video_bitrate_kbps * 2}k",
+            "-pix_fmt", "yuv420p",
+            "-profile:v", "baseline",
+            "-level:v", level,
+            "-x264-params", "nal-hrd=cbr",
+        ])
+    elif "nvenc" in video_encoder:
+        cmd.extend([
+            "-b:v", f"{target_video_bitrate_kbps}k",
+            "-maxrate", f"{target_video_bitrate_kbps}k",
+            "-bufsize", f"{target_video_bitrate_kbps * 2}k",
+            "-pix_fmt", "yuv420p",
+            "-profile:v", "baseline",
+            "-level:v", level,
+            "-rc", "cbr",
+        ])
+    elif "qsv" in video_encoder:
+        cmd.extend([
+            "-b:v", f"{target_video_bitrate_kbps}k",
+            "-maxrate", f"{target_video_bitrate_kbps}k",
+            "-bufsize", f"{target_video_bitrate_kbps * 2}k",
+            "-pix_fmt", "nv12",
+            "-profile:v", "baseline",
+            "-level:v", level,
+        ])
+    else:
+        # Fallback / generic encoder
+        cmd.extend([
+            "-b:v", f"{target_video_bitrate_kbps}k",
+            "-maxrate", f"{target_video_bitrate_kbps}k",
+            "-bufsize", f"{target_video_bitrate_kbps * 2}k",
+            "-pix_fmt", "yuv420p",
+            "-profile:v", "baseline",
+            "-level:v", level,
+        ])
+
+    cmd.extend([
         "-metadata:s:v:0", "language=eng",
         "-map", "[aout0]",
         "-c:a:0", "aac",
@@ -190,7 +293,7 @@ def build_encode_command(
         "-brand", "isom",
         "-f", "mp4",
         output_path,
-    ]
+    ])
     return cmd
 
 
@@ -203,10 +306,12 @@ def encode(
     preset: str = "fast",
     level: str = "4.2",
     comment: str = "Patched by CompressBase",
+    video_encoder: str = "libx264",
     progress_callback: Optional[Callable[[float, str], None]] = None,
+    cancel_event: Optional[threading.Event] = None,
 ) -> Dict[str, Any]:
     """
-    Full CompressBase encode pipeline.
+    Full CompressBase encode pipeline with progress tracking and cancellation.
     Calls progress_callback(percent: float, line: str) as encoding proceeds.
     Returns parsed probe dict of the generated MP4.
     """
@@ -224,6 +329,10 @@ def encode(
     else:
         target_kbps = max(500, int(src_bitrate * bitrate_multiplier / 1000))
 
+    # Verify requested encoder is available, fallback to libx264 if needed
+    avail_encoders = get_available_video_encoders()
+    chosen_encoder = video_encoder if video_encoder in avail_encoders else "libx264"
+
     cmd = build_encode_command(
         ffmpeg_path=ffmpeg_path,
         input_path=input_path,
@@ -234,6 +343,7 @@ def encode(
         preset=preset,
         level=level,
         comment=comment,
+        video_encoder=chosen_encoder,
     )
 
     process = subprocess.Popen(
@@ -246,24 +356,38 @@ def encode(
 
     time_re = re.compile(r"time=(\d+):(\d+):([\d.]+)")
 
-    if process.stderr is not None:
-        for line in process.stderr:
-            line = line.rstrip()
-            if progress_callback:
-                percent = 0.0
-                m = time_re.search(line)
-                if m and duration > 0:
-                    h, mn, s = int(m.group(1)), int(m.group(2)), float(m.group(3))
-                    elapsed = h * 3600 + mn * 60 + s
-                    percent = min(99.0, elapsed / duration * 100)
-                progress_callback(percent, line)
+    try:
+        if process.stderr is not None:
+            for line in process.stderr:
+                if cancel_event and cancel_event.is_set():
+                    process.terminate()
+                    try:
+                        process.wait(timeout=2)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                    raise RuntimeError("Encoding cancelled by user.")
 
-    process.wait()
-    if process.returncode != 0:
-        raise RuntimeError(f"ffmpeg encoding failed with exit code {process.returncode}")
+                line = line.rstrip()
+                if progress_callback:
+                    percent = 0.0
+                    m = time_re.search(line)
+                    if m and duration > 0:
+                        h, mn, s = int(m.group(1)), int(m.group(2)), float(m.group(3))
+                        elapsed = h * 3600 + mn * 60 + s
+                        percent = min(99.0, elapsed / duration * 100)
+                    progress_callback(percent, line)
 
-    if progress_callback:
-        progress_callback(100.0, "Encoding complete.")
+        process.wait()
+        if process.returncode != 0:
+            raise RuntimeError(f"ffmpeg encoding failed with exit code {process.returncode}")
+
+        if progress_callback:
+            progress_callback(100.0, "Encoding complete.")
+
+    except Exception:
+        if process.poll() is None:
+            process.kill()
+        raise
 
     return probe(output_path)
 

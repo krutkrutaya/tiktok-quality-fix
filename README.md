@@ -1,8 +1,8 @@
-# TikTok Quality Fix (CompressBase Method)
+# TikTok Quality Fix (CompressBase Method) — Modern Edition
 
 Advanced tool for uploading videos to TikTok with maximum **1080p60fps** fidelity without quality loss, compression degradation, or shadowban risk.
 
-Powered by the **CompressBase** encoding pipeline and low-level **ISOBMFF** container binary patching.
+Powered by the **CompressBase** encoding pipeline, hardware-accelerated transcoding (NVENC/QSV/AMF/CPU), low-level **ISOBMFF** container binary patching, and a brand-new **Modern CustomTkinter GUI**.
 
 ---
 
@@ -10,8 +10,9 @@ Powered by the **CompressBase** encoding pipeline and low-level **ISOBMFF** cont
 
 TikTok often compresses uploaded videos heavily or applies aggressive downscaling and artifact-inducing transcodes. This tool resolves this issue by applying the industry-standard **CompressBase** method:
 
-1. **Precision Re-encoding (FFmpeg)**:
+1. **Precision Re-encoding (FFmpeg + Hardware Acceleration)**:
    - Video is encoded to **H.264 Constrained Baseline (L4.2)** with CBR and HRD buffer compliance (`nal-hrd=cbr`), in `yuv420p` color space.
+   - Support for **NVIDIA NVENC**, **Intel QSV**, and **AMD AMF** GPU acceleration with automatic fallback to high-quality CPU `libx264`.
    - Dual **AAC-LC 48kHz stereo** audio streams are generated via an `asplit` filtergraph (Track 1: 190 kbps, Track 2: 215 kbps) with default disposition and `eng` language tags.
    - Cleans all source metadata (`-map_metadata -1`) and writes faststart atoms with color tags (`+faststart+write_colr`).
 2. **Binary ISOBMFF Atom Patching**:
@@ -22,8 +23,8 @@ TikTok often compresses uploaded videos heavily or applies aggressive downscalin
    - **Audio Track 2 Sample Inflation**: Inflates declared `nb_frames` on the second audio track (x10 multiplier) by restructuring `stsz`, `stts`, and `stsc` tables without altering physical audio frames.
 3. **Specification Validation**:
    - Automatically validates the final output against `target_spec.json`.
-4. **Modern GUI & CLI**:
-   - Includes a full **Tkinter Graphical User Interface** (`tiktok-quality-gui`) with batch queuing, live logs, progress bars, and preset selectors.
+4. **Modern CustomTkinter GUI & CLI**:
+   - Includes a sleek **CustomTkinter Dark/Light Interface** (`tiktok-quality-gui`) with batch queuing, live logs, dual progress bars, preset profiles, and responsive cancellation.
 
 ---
 
@@ -50,6 +51,7 @@ sudo apt install ffmpeg
 ```bash
 git clone https://github.com/krutkrutaya/tiktok-quality-fix.git
 cd tiktok-quality-fix
+pip install -r requirements.txt
 pip install -e .
 ```
 
@@ -57,9 +59,9 @@ pip install -e .
 
 ## 💻 Usage
 
-### 1. Graphical User Interface (GUI)
+### 1. Graphical User Interface (Modern CustomTkinter GUI)
 
-Launch the batch-processing GUI with one command:
+Launch the modern batch-processing GUI with one command:
 
 ```bash
 tiktok-quality-gui
@@ -67,11 +69,18 @@ tiktok-quality-gui
 python -m tiktok_quality --gui
 ```
 
-Features of the GUI:
-- Add single or multiple video files (batch queue).
-- Set bitrate multiplier, preset (`ultrafast` to `slow`), H.264 level, and audio bitrates.
-- Dual progress bars (Current file + Overall queue).
-- Live colorized log viewer with ffprobe probe breakdown and validation results.
+Features of the Modern GUI:
+- **Card-based Responsive Layout**: Dark/Light mode theme switcher.
+- **Batch Video Queue**: Add multiple video files or folders, with size and status indicators.
+- **Preset Selector**:
+  - `⚡ TikTok 1080p60 (Recommended)`
+  - `💎 Maximum Quality (HQ)`
+  - `🚀 Ultra Fast`
+  - `⚙️ Custom Configuration`
+- **Hardware Acceleration Dropdown**: Auto, NVIDIA NVENC, Intel QSV, AMD AMF, or CPU libx264.
+- **Dual Progress Bars**: Individual file progress + Overall batch queue progress.
+- **Live Activity Console**: Real-time FFmpeg time tracking and validation feedback.
+- **Cancellation**: Safe and responsive cancellation at any point.
 
 ---
 
@@ -84,9 +93,14 @@ tiktok-quality input.mp4 output.mp4
 python -m tiktok_quality input.mp4 output.mp4
 ```
 
+#### Hardware Acceleration (NVENC / QSV / AMF)
+```bash
+tiktok-quality input.mp4 output.mp4 --encoder h264_nvenc
+```
+
 #### Custom Bitrate & Speed Preset
 ```bash
-tiktok-quality input.mp4 output.mp4 --bitrate-multiplier 0.9 --preset slow
+tiktok-quality input.mp4 output.mp4 --bitrate-multiplier 1.1 --preset slow
 ```
 
 #### Custom Audio Bitrates & Level
@@ -99,7 +113,7 @@ tiktok-quality input.mp4 output.mp4 --audio-bitrate1 192 --audio-bitrate2 256 --
 tiktok-quality --verify output.mp4
 ```
 
-#### Check Dependencies
+#### Check Dependencies & Available Hardware Encoders
 ```bash
 tiktok-quality --check-deps
 ```
@@ -118,7 +132,8 @@ tiktok-quality input.mp4 output.mp4 --legacy-transform --randomize
 |-----------|------|---------|-------------|
 | `input` | Path | Required | Path to input video file |
 | `output` | Path | Required | Path to save processed MP4 |
-| `--gui` | Flag | - | Launch Tkinter GUI |
+| `--gui` | Flag | - | Launch Modern CustomTkinter GUI |
+| `--encoder` | String | `auto` | Video encoder (`auto`, `libx264`, `h264_nvenc`, `h264_qsv`, `h264_amf`) |
 | `--bitrate-multiplier` | Float | `1.0` | Target video bitrate multiplier (1.0 = 100% of source) |
 | `--preset` | String | `fast` | FFmpeg preset (`ultrafast`, `faster`, `fast`, `medium`, `slow`) |
 | `--level` | String | `4.2` | Target H.264 level |
@@ -129,7 +144,7 @@ tiktok-quality input.mp4 output.mp4 --legacy-transform --randomize
 | `--legacy-transform` | Flag | - | Run legacy ghost-frame injection (no re-encoding) |
 | `--randomize` | Flag | - | Enable random filler blocks and timestamp jitter |
 | `--verify FILE` | Path | - | Inspect and validate file with ffprobe |
-| `--check-deps` | Flag | - | Check Python and FFmpeg availability |
+| `--check-deps` | Flag | - | Check Python, FFmpeg, and GPU encoders availability |
 
 ---
 
@@ -138,54 +153,44 @@ tiktok-quality input.mp4 output.mp4 --legacy-transform --randomize
 ```
 tiktok-quality-fix/
 ├── pyproject.toml
+├── requirements.txt
 ├── README.md
 ├── LICENSE
-├── proof.png
-├── src/tiktok_quality/
-│   ├── __init__.py          # Package entry and API exports
-│   ├── __main__.py          # CLI / GUI router
-│   ├── cli.py               # Unified CLI
-│   ├── gui.py               # Tkinter GUI application
-│   ├── compressbase.py      # Core CompressBase pipeline orchestrator
-│   ├── encoder.py           # FFmpeg wrapper (CBL L4.2, Dual AAC, faststart)
-│   ├── patcher.py           # Recursive ISOBMFF parser and binary patcher
-│   ├── validator.py         # Target specification compliance validator
-│   ├── target_spec.json     # Reference JSON spec for output compliance
-│   ├── transform.py         # Legacy ghost-frames container manipulator
-│   ├── randomize.py         # Entropy & randomization utilities
-│   ├── detect.py            # Heuristic detection analyzer
-│   └── mp4/                 # Low-level MP4 box builders and parsers
+├── src/
+│   └── tiktok_quality/
 │       ├── __init__.py
-│       ├── parser.py
-│       └── builder.py
+│       ├── __main__.py
+│       ├── cli.py             # CLI parser & runner
+│       ├── gui.py             # Modern CustomTkinter Graphical Interface
+│       ├── compressbase.py    # Main pipeline orchestrator
+│       ├── encoder.py         # FFmpeg / ffprobe wrappers & HW accel detection
+│       ├── patcher.py         # Low-level binary ISOBMFF atom patcher
+│       ├── validator.py       # TikTok CompressBase spec validation
+│       ├── target_spec.json   # JSON validation target criteria
+│       ├── transform.py       # Legacy ghost-frames injector
+│       ├── randomize.py       # Filler NAL generator & jitter
+│       ├── detect.py          # Entropy & offset heuristics
+│       └── mp4/
+│           ├── builder.py     # Atom serialisation primitives
+│           └── parser.py      # Low-level MP4 box walker
 └── tests/
-    ├── test_mp4.py          # MP4 box parsing and building unit tests
-    ├── test_patcher.py      # ISOBMFF binary patcher unit tests
-    ├── test_randomize.py    # Randomization and entropy unit tests
-    └── test_validator.py    # Target spec validation unit tests
+    ├── test_mp4.py
+    ├── test_patcher.py
+    ├── test_randomize.py
+    └── test_validator.py
 ```
 
 ---
 
-## 🧪 Running Automated Tests
+## 🧪 Testing
 
-Run the test suite with standard Python (zero external test dependencies required):
-
+Run test suite:
 ```bash
-python -m unittest discover -s tests -v
+python -m unittest discover tests
 ```
 
 ---
 
-## 🛡️ Best Practices for Uploading to TikTok
+## 📜 License
 
-1. **Always export master videos at 1080x1920 (9:16 vertical) 60fps** with clean audio.
-2. Enable **"Upload HD / Allow high-quality uploads"** in TikTok's advance settings before posting.
-3. Process your video with `tiktok-quality input.mp4 output.mp4` or the GUI.
-4. Allow TikTok 2-5 minutes after uploading before making the video public.
-
----
-
-## 📝 License
-
-MIT — see [LICENSE](LICENSE) for details.
+MIT License. Created by [krutkrutaya](https://github.com/krutkrutaya).

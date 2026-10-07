@@ -24,3 +24,6 @@ Thumbs.db
 *.avi
 *.mov
 test_output/
+*rezervCopy/
+*.log
+.pytest_cache/
